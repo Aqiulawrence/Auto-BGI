@@ -1,10 +1,3 @@
-"""Invoke BetterGI controls independently of user mouse movement, then run One Dragon.
-
-Install once: python -m pip install comtypes
-Run: python auto_bgi.py
-Requires Windows; requests administrator rights through UAC when needed.
-"""
-
 from __future__ import annotations
 
 import argparse
