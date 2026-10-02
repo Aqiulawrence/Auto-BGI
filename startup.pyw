@@ -1,5 +1,3 @@
-"""登录时仅在主桌面启动 Steam 和 Clash Verge。"""
-
 import ctypes
 import os
 import subprocess
@@ -29,5 +27,6 @@ if kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session)):
                 clash = r"C:\Program Files\Clash Verge\clash-verge.exe"
                 subprocess.Popen([steam, "-silent"], cwd=os.path.dirname(steam))
                 subprocess.Popen([clash], cwd=os.path.dirname(clash))
+                os.startfile(r"C:\Users\Admin\Desktop\待办.txt")
         finally:
             wts.WTSFreeMemory(buffer)
