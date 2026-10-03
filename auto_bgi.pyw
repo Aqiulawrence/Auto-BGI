@@ -12,8 +12,10 @@ import time
 import traceback
 import uuid
 import xml.etree.ElementTree as ET
+from contextlib import redirect_stderr, redirect_stdout
 from ctypes import wintypes
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 DEFAULT_EXE = Path(r"D:\Tools\BetterGI\BetterGI.exe")
@@ -567,7 +569,7 @@ def run(exe: Path, config: str, timeout: int) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    parser.parse_args()
     if sys.platform != "win32":
         parser.error("仅支持 Windows")
     exe = DEFAULT_EXE.expanduser().resolve()
@@ -594,13 +596,18 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr, flush=True)
         traceback.print_exc()
-        if args.elevated:
-            try:
-                input("按回车关闭此窗口…")
-            except EOFError:
-                pass
         return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    log_path = Path(__file__).with_suffix(".log")
+    with log_path.open("a", encoding="utf-8", buffering=1) as log_file:
+        with redirect_stdout(log_file), redirect_stderr(log_file):
+            print(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] 启动 PID {os.getpid()}", flush=True)
+            try:
+                exit_code = main()
+            except Exception:
+                traceback.print_exc()
+                exit_code = 1
+            print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] 退出，代码 {exit_code}", flush=True)
+    raise SystemExit(exit_code)
