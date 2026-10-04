@@ -1,3 +1,5 @@
+"""安装登录任务，或在主桌面中启动常用程序。"""
+
 import base64
 import ctypes
 import os
@@ -7,15 +9,22 @@ from pathlib import Path
 from ctypes import wintypes
 
 TASK_NAME = "Auto-BGI Startup"
+STARTUP_PROGRAMS = (
+    (Path(r"C:\Program Files (x86)\Steam\steam.exe"), ("-silent",)),
+    (Path(r"C:\Program Files\Clash Verge\clash-verge.exe"), ()),
+)
+TODO_FILE = Path(r"C:\Users\Admin\Desktop\待办.txt")
+
+
+def ps_string(value: str) -> str:
+    """把值编码为 PowerShell 单引号字符串。"""
+    return "'" + value.replace("'", "''") + "'"
 
 def install_task() -> None:
     script = Path(__file__).resolve()
     pythonw = Path(sys.executable).with_name("pythonw.exe")
     if not pythonw.is_file():
         raise FileNotFoundError(f"找不到 pythonw.exe：{pythonw}")
-
-    def ps_string(value: str) -> str:
-        return "'" + value.replace("'", "''") + "'"
 
     command = f"""
 $ErrorActionPreference = 'Stop'
@@ -36,33 +45,42 @@ Register-ScheduledTask -TaskName {ps_string(TASK_NAME)} -Action $action -Trigger
                            or f"计划任务创建失败，退出代码 {result.returncode}")
 
 
-def run_startup() -> None:
+def is_main_desktop() -> bool:
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     wts = ctypes.WinDLL("wtsapi32", use_last_error=True)
     kernel32.ProcessIdToSessionId.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    kernel32.ProcessIdToSessionId.restype = wintypes.BOOL
     wts.WTSQuerySessionInformationW.argtypes = [
         wintypes.HANDLE, wintypes.DWORD, ctypes.c_int,
         ctypes.POINTER(ctypes.c_void_p), ctypes.POINTER(wintypes.DWORD),
     ]
+    wts.WTSQuerySessionInformationW.restype = wintypes.BOOL
     wts.WTSFreeMemory.argtypes = [ctypes.c_void_p]
+    wts.WTSFreeMemory.restype = None
 
     session = wintypes.DWORD()
     buffer = ctypes.c_void_p()
     size = wintypes.DWORD()
-    if kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session)):
-        # WTSClientProtocolType = 16；主桌面为 0，RDP 分身为 2。
-        if wts.WTSQuerySessionInformationW(
-            None, session.value, 16, ctypes.byref(buffer), ctypes.byref(size)
-        ):
-            try:
-                if size.value >= 2 and ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ushort))[0] == 0:
-                    steam = r"C:\Program Files (x86)\Steam\steam.exe"
-                    clash = r"C:\Program Files\Clash Verge\clash-verge.exe"
-                    subprocess.Popen([steam, "-silent"], cwd=os.path.dirname(steam))
-                    subprocess.Popen([clash], cwd=os.path.dirname(clash))
-                    os.startfile(r"C:\Users\Admin\Desktop\待办.txt")
-            finally:
-                wts.WTSFreeMemory(buffer)
+    if not kernel32.ProcessIdToSessionId(os.getpid(), ctypes.byref(session)):
+        return False
+    # WTSClientProtocolType = 16；主桌面为 0，RDP 分身为 2。
+    if not wts.WTSQuerySessionInformationW(
+        None, session.value, 16, ctypes.byref(buffer), ctypes.byref(size)
+    ):
+        return False
+    try:
+        return (bool(buffer) and size.value >= ctypes.sizeof(ctypes.c_ushort)
+                and ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ushort))[0] == 0)
+    finally:
+        wts.WTSFreeMemory(buffer)
+
+
+def run_startup() -> None:
+    if not is_main_desktop():
+        return
+    for executable, arguments in STARTUP_PROGRAMS:
+        subprocess.Popen([str(executable), *arguments], cwd=str(executable.parent))
+    os.startfile(str(TODO_FILE))
 
 
 if __name__ == "__main__":
