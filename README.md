@@ -13,6 +13,8 @@
 
 运行记录和错误会追加到脚本旁的 `auto_bgi.log`。BetterGI 自己的日志仍在其安装目录的 `log` 文件夹中。如果流程中途报错，先查看 `auto_bgi.log`；此时分身或 BetterGI 可能仍在运行。
 
+脚本正常退出或报错退出时，会将 `HKEY_CURRENT_USER\Software\miHoYo\原神` 下的 `Screenmanager Resolution Height_h2627697771` 写为 `1440`，将 `Screenmanager Resolution Width_h182942802` 写为 `2560`，类型均为 `REG_DWORD`。从控制台运行时，按 `Ctrl+C` 或点击控制台窗口右上角的关闭按钮也会执行恢复。恢复结果写入 `auto_bgi.log`；强制结束进程或断电等情况不在支持范围内。
+
 ---
 
 双击 `startup.pyw`，或用 `pythonw.exe` 运行它，会创建或更新名为 `Auto-BGI Startup` 的计划任务。创建成功后会显示提示；下次当前用户登录 Windows 时，任务在交互式桌面中运行脚本。直接运行脚本只负责设置自启，不会立即启动下面的程序。

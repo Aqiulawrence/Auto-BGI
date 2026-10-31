@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import ctypes
 import getpass
 import os
@@ -11,6 +12,7 @@ import sys
 import time
 import traceback
 import uuid
+import winreg
 import xml.etree.ElementTree as ET
 from contextlib import contextmanager, redirect_stderr, redirect_stdout
 from ctypes import wintypes
@@ -31,6 +33,35 @@ ERROR_NOT_FOUND = 1168
 STARTUP_INTERVAL = 0.01
 T = TypeVar("T")
 WINDOW_CALLBACK = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+_restore_resolution_on_exit = True
+
+
+def restore_game_resolution() -> None:
+    """普通退出和关闭控制台时，将原神分辨率写回 2560 × 1440。"""
+    if not _restore_resolution_on_exit:
+        return
+    try:
+        with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, r"Software\miHoYo\原神",
+                                0, winreg.KEY_SET_VALUE) as key:
+            winreg.SetValueEx(key, "Screenmanager Resolution Height_h2627697771",
+                             0, winreg.REG_DWORD, 1440)
+            winreg.SetValueEx(key, "Screenmanager Resolution Width_h182942802",
+                             0, winreg.REG_DWORD, 2560)
+        message = "已恢复原神分辨率：2560 × 1440"
+    except OSError as exc:
+        message = f"恢复原神分辨率失败：{exc}"
+    # atexit 执行时主日志已关闭，需要单独打开。
+    try:
+        with Path(__file__).with_suffix(".log").open("a", encoding="utf-8") as log_file:
+            log_file.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}\n")
+    except OSError:
+        pass
+
+
+def handle_console_exit(event: int) -> bool:
+    if event == 2:  # CTRL_CLOSE_EVENT：点击控制台窗口右上角的叉。
+        restore_game_resolution()
+    return False
 
 
 class ProcessEntry(ctypes.Structure):
@@ -562,6 +593,7 @@ def run(exe: Path) -> None:
 
 
 def main() -> int:
+    global _restore_resolution_on_exit
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -576,6 +608,8 @@ def main() -> int:
         if result <= 32:
             print(f"管理员权限请求已取消或失败（代码 {result}）", file=sys.stderr)
             return 1
+        # 启动器退出时，管理员进程还在运行，由它负责最终恢复。
+        _restore_resolution_on_exit = False
         print("已启动管理员后台进程，后续进度继续写入 auto_bgi.log。")
         return 0
     exe = DEFAULT_EXE.expanduser().resolve()
@@ -592,6 +626,14 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    atexit.register(restore_game_resolution)
+    # Windows 关闭控制台不会执行 atexit，单独接收关闭通知。
+    console_callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    console_callback = console_callback_type(handle_console_exit)
+    set_console_handler = ctypes.windll.kernel32.SetConsoleCtrlHandler
+    set_console_handler.argtypes = [console_callback_type, wintypes.BOOL]
+    set_console_handler.restype = wintypes.BOOL
+    set_console_handler(console_callback, True)
     log_path = Path(__file__).with_suffix(".log")
     with log_path.open("a", encoding="utf-8", buffering=1) as log_file:
         with redirect_stdout(log_file), redirect_stderr(log_file):
