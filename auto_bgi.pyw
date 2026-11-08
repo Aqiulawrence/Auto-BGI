@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Callable, TypeVar
 
 DEFAULT_EXE = Path(r"D:\Tools\BetterGI\BetterGI.exe")
+# Python 退出时可能已移除 __main__.__file__，退出回调需使用预先保存的路径。
+LOG_PATH = Path(__file__).resolve().with_suffix(".log")
 GAME_NAMES = {"yuanshen.exe", "genshinimpact.exe"}
 LOG_PATTERN = "better-genshin-impact????????.log"
 FINISHED_MESSAGE = "一条龙和配置组任务结束"
@@ -52,7 +54,7 @@ def restore_game_resolution() -> None:
         message = f"恢复原神分辨率失败：{exc}"
     # atexit 执行时主日志已关闭，需要单独打开。
     try:
-        with Path(__file__).with_suffix(".log").open("a", encoding="utf-8") as log_file:
+        with LOG_PATH.open("a", encoding="utf-8") as log_file:
             log_file.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}\n")
     except OSError:
         pass
@@ -634,8 +636,7 @@ if __name__ == "__main__":
     set_console_handler.argtypes = [console_callback_type, wintypes.BOOL]
     set_console_handler.restype = wintypes.BOOL
     set_console_handler(console_callback, True)
-    log_path = Path(__file__).with_suffix(".log")
-    with log_path.open("a", encoding="utf-8", buffering=1) as log_file:
+    with LOG_PATH.open("a", encoding="utf-8", buffering=1) as log_file:
         with redirect_stdout(log_file), redirect_stderr(log_file):
             print(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] 启动 PID {os.getpid()}", flush=True)
             try:
