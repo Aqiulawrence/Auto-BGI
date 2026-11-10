@@ -9,6 +9,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -19,7 +20,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, TypeVar
+from typing import Callable, Iterator, TypeVar
 
 DEFAULT_EXE = Path(r"D:\Tools\BetterGI\BetterGI.exe")
 # Python 退出时可能已移除 __main__.__file__，退出回调需使用预先保存的路径。
@@ -76,6 +77,14 @@ class ProcessEntry(ctypes.Structure):
     ]
 
 
+class FlashWindowInfo(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.UINT), ("hwnd", wintypes.HWND),
+        ("dwFlags", wintypes.DWORD), ("uCount", wintypes.UINT),
+        ("dwTimeout", wintypes.DWORD),
+    ]
+
+
 def configure_winapi() -> None:
     k = ctypes.windll.kernel32
     k.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
@@ -115,6 +124,8 @@ def configure_winapi() -> None:
     ctypes.windll.user32.EnumWindows.restype = wintypes.BOOL
     ctypes.windll.user32.IsWindowVisible.argtypes = [wintypes.HWND]
     ctypes.windll.user32.IsWindowVisible.restype = wintypes.BOOL
+    ctypes.windll.user32.FlashWindowEx.argtypes = [ctypes.POINTER(FlashWindowInfo)]
+    ctypes.windll.user32.FlashWindowEx.restype = wintypes.BOOL
 
 
 def session_of(pid: int) -> int | None:
@@ -476,6 +487,60 @@ class DesktopContext:
     old_child_pid: int
 
 
+@contextmanager
+def suppress_taskbar_flashing(main_pid: int) -> Iterator[None]:
+    """任务期间清除主进程最小化窗口的提醒，退出时停止后台线程。"""
+    stop = threading.Event()
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    # 持有原进程句柄，避免进程退出后 PID 被其他程序复用。
+    process = kernel32.OpenProcess(SYNCHRONIZE, False, main_pid)
+    if not process:
+        raise ctypes.WinError()
+
+    def clear_flashing() -> None:
+        errors: list[Exception] = []
+
+        @WINDOW_CALLBACK
+        def clear(hwnd, _):
+            try:
+                if window_owner(hwnd) == main_pid and user32.IsIconic(hwnd):
+                    info = FlashWindowInfo()
+                    info.cbSize = ctypes.sizeof(info)
+                    info.hwnd = hwnd
+                    info.dwFlags = 0  # FLASHW_STOP
+                    # 返回值是调用前的激活状态，False 不表示失败。
+                    user32.FlashWindowEx(ctypes.byref(info))
+            except Exception as exc:
+                errors.append(exc)
+            return True
+
+        try:
+            while not stop.is_set():
+                state = kernel32.WaitForSingleObject(process, 0)
+                if state == WAIT_OBJECT_0:
+                    return
+                if state != 0x00000102:  # WAIT_TIMEOUT
+                    raise ctypes.WinError()
+                if not user32.EnumWindows(clear, 0):
+                    raise ctypes.WinError()
+                if errors:
+                    raise errors[0]
+                stop.wait(0.1)
+        except Exception as exc:
+            print(f"清除 BetterGI 任务栏闪烁失败：{exc}", flush=True)
+
+    worker = threading.Thread(target=clear_flashing, name="bgi-flash-stop", daemon=True)
+    try:
+        worker.start()
+        yield
+    finally:
+        stop.set()
+        if worker.ident is not None:
+            worker.join()
+        kernel32.CloseHandle(process)
+
+
 def minimize_windows(main_pid: int, *handles: int) -> None:
     """两个窗口首次最小化后，再检测 1 秒以处理重新弹出的窗口。"""
     user32 = ctypes.windll.user32
@@ -511,8 +576,9 @@ def minimize_windows(main_pid: int, *handles: int) -> None:
         time.sleep(STARTUP_INTERVAL)
 
 
+@contextmanager
 def open_and_connect(ui: FastUIA, exe: Path, current_session: int,
-                     timeout: int) -> DesktopContext:
+                     timeout: int) -> Iterator[DesktopContext]:
     # Fast path: wait for native windows and invoke the two WPF buttons.
     main = find_window("更好的原神", current_session)
     if main is None:
@@ -527,8 +593,9 @@ def open_and_connect(ui: FastUIA, exe: Path, current_session: int,
                      20, "桌面分身窗口")
     child_hwnd, _ = child
     ui.invoke(child_hwnd, ("启动并连接", "启动"), 20)
-    minimize_windows(main_pid, child_hwnd, main_hwnd)
-    return connect_child(exe, main_hwnd, main_pid, timeout)
+    with suppress_taskbar_flashing(main_pid):
+        minimize_windows(main_pid, child_hwnd, main_hwnd)
+        yield connect_child(exe, main_hwnd, main_pid, timeout)
 
 
 def connect_child(exe: Path, main_hwnd: int, main_pid: int,
@@ -587,10 +654,10 @@ def run(exe: Path) -> None:
     current_session = session_of(os.getpid())
     if current_session is None:
         raise RuntimeError("无法取得当前 Windows 会话")
-    desktop = open_and_connect(ui, exe, current_session, 120)
-    log, child_pid = start_one_dragon(exe, desktop)
-    monitor_completion(desktop.child_id, child_pid, log)
-    close_after_completion(desktop.main_hwnd, desktop.main_pid, desktop.child_id)
+    with open_and_connect(ui, exe, current_session, 120) as desktop:
+        log, child_pid = start_one_dragon(exe, desktop)
+        monitor_completion(desktop.child_id, child_pid, log)
+        close_after_completion(desktop.main_hwnd, desktop.main_pid, desktop.child_id)
     print("桌面分身与 BetterGI 主进程已关闭。", flush=True)
 
 
