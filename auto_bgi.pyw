@@ -5,13 +5,13 @@ import argparse
 import atexit
 import ctypes
 import getpass
+import logging
 import os
 import re
 import subprocess
 import sys
 import threading
 import time
-import traceback
 import uuid
 import winreg
 import xml.etree.ElementTree as ET
@@ -37,6 +37,14 @@ STARTUP_INTERVAL = 0.01
 T = TypeVar("T")
 WINDOW_CALLBACK = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 _restore_resolution_on_exit = True
+logger = logging.getLogger("auto_bgi")
+
+
+class LoggedArgumentParser(argparse.ArgumentParser):
+    def _print_message(self, message: str, file=None) -> None:
+        if message:
+            logger.log(logging.ERROR if file is sys.stderr else logging.INFO,
+                       message.rstrip("\n"))
 
 
 def restore_game_resolution() -> None:
@@ -345,7 +353,7 @@ def delete_task(folder, name: str) -> None:
     try:
         folder.DeleteTask(name, 0)
     except Exception as exc:
-        print(f"清理临时计划任务失败：{exc}", file=sys.stderr, flush=True)
+        logger.warning("清理临时计划任务失败：%s", exc)
 
 
 @contextmanager
@@ -431,7 +439,7 @@ class StableCondition:
 
 
 def monitor_completion(child_id: int, child_pid: int, log: CompletionLog) -> None:
-    print("正在等待分身内一条龙完成…", flush=True)
+    logger.info("正在等待分身内一条龙完成…")
     finished = False
     game_absent = StableCondition(3)
     session_absent = StableCondition(5)
@@ -439,7 +447,7 @@ def monitor_completion(child_id: int, child_pid: int, log: CompletionLog) -> Non
     while True:
         if not finished and log.completed():
             finished = True
-            print("已检测到分身的一条龙结束日志；等待游戏关闭…", flush=True)
+            logger.info("已检测到分身的一条龙结束日志；等待游戏关闭…")
         current_child_id = child_session()
         now = time.monotonic()
         if session_absent.reached(current_child_id != child_id, now):
@@ -449,7 +457,7 @@ def monitor_completion(child_id: int, child_pid: int, log: CompletionLog) -> Non
         if finished:
             if (game_absent.reached(not named_process_running(child_id, GAME_NAMES), now)
                     and current_child_id == child_id):
-                print("分身中的游戏已关闭。", flush=True)
+                logger.info("分身中的游戏已关闭。")
                 return
         elif bettergi_absent.reached(not process_running(child_pid, "bettergi.exe"), now):
             raise RuntimeError("分身 BetterGI 已退出，但未检测到一条龙结束日志")
@@ -462,13 +470,13 @@ def close_after_completion(main_hwnd: int, main_pid: int, child_id: int) -> None
         raise RuntimeError(
             f"桌面分身会话已变化（原 Session {child_id}，当前 {current_child_id}），"
             "为避免注销其他会话，已停止清理")
-    print("注销桌面分身…", flush=True)
+    logger.info("注销桌面分身…")
     if current_child_id == child_id:
         if not ctypes.windll.wtsapi32.WTSLogoffSession(None, child_id, True):
             raise RuntimeError(f"注销分身失败：{ctypes.WinError()}")
         wait_for(lambda: child_session() is None, 15,
                  "桌面分身会话注销完成", interval=0.25)
-    print("关闭 BetterGI 主进程…", flush=True)
+    logger.info("关闭 BetterGI 主进程…")
     if not process_running(main_pid, "bettergi.exe"):
         return
     if window_owner(main_hwnd) != main_pid:
@@ -528,7 +536,7 @@ def suppress_taskbar_flashing(main_pid: int) -> Iterator[None]:
                     raise errors[0]
                 stop.wait(0.1)
         except Exception as exc:
-            print(f"清除 BetterGI 任务栏闪烁失败：{exc}", flush=True)
+            logger.warning("清除 BetterGI 任务栏闪烁失败：%s", exc)
 
     worker = threading.Thread(target=clear_flashing, name="bgi-flash-stop", daemon=True)
     try:
@@ -582,7 +590,7 @@ def open_and_connect(ui: FastUIA, exe: Path, current_session: int,
     # Fast path: wait for native windows and invoke the two WPF buttons.
     main = find_window("更好的原神", current_session)
     if main is None:
-        print("启动 BetterGI…", flush=True)
+        logger.info("启动 BetterGI…")
         subprocess.Popen([str(exe)], cwd=str(exe.parent))
         main = wait_for(lambda: find_window("更好的原神", current_session),
                         60, "BetterGI 主窗口")
@@ -600,9 +608,9 @@ def open_and_connect(ui: FastUIA, exe: Path, current_session: int,
 
 def connect_child(exe: Path, main_hwnd: int, main_pid: int,
                   timeout: int) -> DesktopContext:
-    print("窗口最小化完成；等待桌面分身连接和登录…", flush=True)
+    logger.info("窗口最小化完成；等待桌面分身连接和登录…")
     child_id = wait_for(child_session, timeout, "桌面分身会话")
-    print(f"已发现分身 Session {child_id}；等待分身内 BetterGI 启动…", flush=True)
+    logger.info("已发现分身 Session %s；等待分身内 BetterGI 启动…", child_id)
 
     def check_connection() -> None:
         if child_session() != child_id:
@@ -615,7 +623,7 @@ def connect_child(exe: Path, main_hwnd: int, main_pid: int,
         return named_process_pid(child_id, "bettergi.exe")
 
     old_pid = wait_for(child_process, timeout, "分身内 BetterGI 登录并启动")
-    print(f"分身 BetterGI PID {old_pid}；等待连接主实例…", flush=True)
+    logger.info("分身 BetterGI PID %s；等待连接主实例…", old_pid)
 
     def connected() -> bool:
         check_connection()
@@ -630,8 +638,7 @@ def connect_child(exe: Path, main_hwnd: int, main_pid: int,
 def start_one_dragon(exe: Path, desktop: DesktopContext) -> tuple[CompletionLog, int]:
     child_id = desktop.child_id
     old_pid = desktop.old_child_pid
-    print(f"替换 Session {child_id} 中自动启动的 BetterGI，以便执行一条龙…",
-          flush=True)
+    logger.info("替换 Session %s 中自动启动的 BetterGI，以便执行一条龙…", child_id)
     replace_idle_child_bettergi(child_id, old_pid)
     log = CompletionLog(exe.parent / "log", child_id)
     with send_one_dragon(exe, child_id, old_pid):
@@ -639,7 +646,7 @@ def start_one_dragon(exe: Path, desktop: DesktopContext) -> tuple[CompletionLog,
                            30, "新分身 BetterGI 进程")
         wait_for(lambda: log.completed() or log.started, 60,
                  "分身内一条龙启动日志")
-    print(f"已确认一条龙在分身 Session {child_id} 启动。", flush=True)
+    logger.info("已确认一条龙在分身 Session %s 启动。", child_id)
     return log, new_pid
 
 
@@ -658,12 +665,12 @@ def run(exe: Path) -> None:
         log, child_pid = start_one_dragon(exe, desktop)
         monitor_completion(desktop.child_id, child_pid, log)
         close_after_completion(desktop.main_hwnd, desktop.main_pid, desktop.child_id)
-    print("桌面分身与 BetterGI 主进程已关闭。", flush=True)
+    logger.info("桌面分身与 BetterGI 主进程已关闭。")
 
 
 def main() -> int:
     global _restore_resolution_on_exit
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = LoggedArgumentParser(description=__doc__)
     parser.add_argument("--elevated", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if sys.platform != "win32":
@@ -675,26 +682,29 @@ def main() -> int:
         result = ctypes.windll.shell32.ShellExecuteW(
             None, "runas", sys.executable, subprocess.list2cmdline(argv), None, 1)
         if result <= 32:
-            print(f"管理员权限请求已取消或失败（代码 {result}）", file=sys.stderr)
+            logger.error("管理员权限请求已取消或失败（代码 %s）", result)
             return 1
         # 启动器退出时，管理员进程还在运行，由它负责最终恢复。
         _restore_resolution_on_exit = False
-        print("已启动管理员后台进程，后续进度继续写入 auto_bgi.log。")
         return 0
+    logger.info("启动 PID %s", os.getpid())
     exe = DEFAULT_EXE.expanduser().resolve()
     if not exe.is_file():
         parser.error(f"找不到 BetterGI：{exe}")
     try:
         import comtypes.client  # noqa: F401
     except ImportError:
-        print("请先安装 Python 依赖：", file=sys.stderr)
-        print(f'"{sys.executable}" -m pip install comtypes', file=sys.stderr)
+        logger.error('请先安装 Python 依赖：\n"%s" -m pip install comtypes', sys.executable)
         return 2
     run(exe)
     return 0
 
 
 if __name__ == "__main__":
+    # 非管理员进程只负责提权，不打开日志，也不注册退出恢复回调。
+    if not ctypes.windll.shell32.IsUserAnAdmin():
+        logger.disabled = True
+        raise SystemExit(main())
     atexit.register(restore_game_resolution)
     # Windows 关闭控制台不会执行 atexit，单独接收关闭通知。
     console_callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
@@ -704,12 +714,20 @@ if __name__ == "__main__":
     set_console_handler.restype = wintypes.BOOL
     set_console_handler(console_callback, True)
     with LOG_PATH.open("a", encoding="utf-8", buffering=1) as log_file:
+        log_file.write("\n")
+        handler = logging.StreamHandler(log_file)
+        handler.setFormatter(logging.Formatter(
+            "[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        logger.addHandler(handler)
         with redirect_stdout(log_file), redirect_stderr(log_file):
-            print(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] 启动 PID {os.getpid()}", flush=True)
             try:
                 exit_code = main()
             except Exception:
-                traceback.print_exc()
+                logger.exception("运行失败")
                 exit_code = 1
-            print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] 退出，代码 {exit_code}", flush=True)
+            logger.info("退出，代码 %s", exit_code)
+        logger.removeHandler(handler)
+        handler.close()
     raise SystemExit(exit_code)
