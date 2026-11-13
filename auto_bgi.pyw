@@ -64,7 +64,7 @@ def restore_game_resolution() -> None:
     # atexit 执行时主日志已关闭，需要单独打开。
     try:
         with LOG_PATH.open("a", encoding="utf-8") as log_file:
-            log_file.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}\n")
+            log_file.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}\n\n")
     except OSError:
         pass
 
@@ -714,7 +714,6 @@ if __name__ == "__main__":
     set_console_handler.restype = wintypes.BOOL
     set_console_handler(console_callback, True)
     with LOG_PATH.open("a", encoding="utf-8", buffering=1) as log_file:
-        log_file.write("\n")
         handler = logging.StreamHandler(log_file)
         handler.setFormatter(logging.Formatter(
             "[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
