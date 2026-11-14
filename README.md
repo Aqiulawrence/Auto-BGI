@@ -15,6 +15,10 @@
 
 脚本正常退出或报错退出时，会将 `HKEY_CURRENT_USER\Software\miHoYo\原神` 下的 `Screenmanager Resolution Height_h2627697771` 写为 `1440`，将 `Screenmanager Resolution Width_h182942802` 写为 `2560`，类型均为 `REG_DWORD`。从控制台运行时，按 `Ctrl+C` 或点击控制台窗口右上角的关闭按钮也会执行恢复。恢复结果写入 `auto_bgi.log`；强制结束进程或断电等情况不在支持范围内。
 
+退出方式由 `auto_bgi.pyw` 开头的 `USE_OFFICIAL_CLEANUP` 控制，默认 `False`（无弹窗）：先通过 Windows `WTSDisconnectSession` 断开 RDP，等待 BetterGI 自己的界面状态变为“RDP 未连接”（最多 30 秒），再通过 `WTSLogoffSession` 注销分身，确认会话消失（最多 60 秒），最后正常关闭主窗口并等待进程退出（最多 20 秒）。无弹窗方式遵循先断开、再注销、最后正常退出的顺序；它使用系统断开接口，而非直接调用 BetterGI 的 RDP COM 方法，两者实现不完全相同。断开失败、BGI 状态未确认、会话发生变化或游戏仍在运行时停止清理，不继续注销或强杀。
+
+设为 `True` 则使用 BetterGI 官方分身关闭入口：请求关闭分身窗口，按 10ms 间隔识别“关闭 BetterGI 桌面分身”确认框并自动确认，由 BetterGI 负责断开、注销和隐藏分身窗口。两种模式都保留主进程的正常退出流程，让 BGI 保存配置和释放自身资源，均不在收尾阶段强制结束主进程。清理失败会明确记录“一条龙已完成，但分身或 BetterGI 主进程清理失败”。
+
 ---
 
 双击 `startup.pyw`，或用 `pythonw.exe` 运行它，会创建或更新名为 `Auto-BGI Startup` 的计划任务。创建成功后会显示提示；下次当前用户登录 Windows 时，任务在交互式桌面中运行脚本。直接运行脚本只负责设置自启，不会立即启动下面的程序。
@@ -26,4 +30,4 @@
 
 随后打开 `C:\Users\Admin\Desktop\待办.txt`。这些路径可在 `startup.pyw` 的 `STARTUP_PROGRAMS` 和 `TODO_FILE` 中修改。
 
-开发验证：在项目目录运行 `python -m unittest discover -s tests -v`。测试使用临时日志文件和模拟系统调用，覆盖日志来源隔离、半行读取、文件截断、完成等待、会话保护、任务清理与主桌面判断，不会启动游戏、注册计划任务或注销会话。实际 BetterGI 的 UI Automation 与 COM 调度仍需在目标环境中验证。
+开发验证：在项目目录运行 `python -m unittest discover -s tests -v`。退出清理测试使用模拟时钟和系统调用，覆盖两种模式的先后顺序、会话和窗口保护、断开状态确认、清理失败、原进程句柄等待和释放，并检查没有收尾强杀调用。测试不会操作真实程序或会话。

@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Callable, Iterator, TypeVar
 
 DEFAULT_EXE = Path(r"D:\Tools\BetterGI\BetterGI.exe")
+# True 使用 BetterGI 官方确认窗口；False 无弹窗，先断开 RDP 再注销。
+USE_OFFICIAL_CLEANUP = False
 # Python 退出时可能已移除 __main__.__file__，退出回调需使用预先保存的路径。
 LOG_PATH = Path(__file__).resolve().with_suffix(".log")
 GAME_NAMES = {"yuanshen.exe", "genshinimpact.exe"}
@@ -32,6 +34,7 @@ TH32CS_SNAPPROCESS = 0x00000002
 PROCESS_TERMINATE = 0x00000001
 SYNCHRONIZE = 0x00100000
 WAIT_OBJECT_0 = 0
+WAIT_TIMEOUT = 0x00000102
 ERROR_NOT_FOUND = 1168
 STARTUP_INTERVAL = 0.01
 T = TypeVar("T")
@@ -113,9 +116,10 @@ def configure_winapi() -> None:
     k.TerminateProcess.restype = wintypes.BOOL
     ctypes.windll.wtsapi32.WTSGetChildSessionId.argtypes = [ctypes.POINTER(wintypes.DWORD)]
     ctypes.windll.wtsapi32.WTSGetChildSessionId.restype = wintypes.BOOL
-    ctypes.windll.wtsapi32.WTSLogoffSession.argtypes = [wintypes.HANDLE,
-        wintypes.DWORD, wintypes.BOOL]
-    ctypes.windll.wtsapi32.WTSLogoffSession.restype = wintypes.BOOL
+    for name in ("WTSDisconnectSession", "WTSLogoffSession"):
+        method = getattr(ctypes.windll.wtsapi32, name)
+        method.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.BOOL]
+        method.restype = wintypes.BOOL
     ctypes.windll.user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
     ctypes.windll.user32.FindWindowW.restype = wintypes.HWND
     ctypes.windll.user32.GetWindowThreadProcessId.argtypes = [
@@ -239,7 +243,7 @@ class FastUIA:
         self.button_type = self.client.CreatePropertyCondition(
             uia.UIA_ControlTypePropertyId, uia.UIA_ButtonControlTypeId)
         self.conditions = {}
-        for name in ("打开", "启动", "启动并连接"):
+        for name in ("打开", "启动", "启动并连接", "是"):
             name_condition = self.client.CreatePropertyCondition(
                 uia.UIA_NamePropertyId, name)
             self.conditions[name] = self.client.CreateAndCondition(
@@ -273,6 +277,16 @@ class FastUIA:
                 return name
             time.sleep(STARTUP_INTERVAL)
         raise TimeoutError(f"等待按钮 {names} 超时（{seconds} 秒）")
+
+    def rdp_disconnected(self, hwnd: int) -> bool:
+        """读取 BGI 自己显示的控件连接状态，确认它已处理断开通知。"""
+        condition = self.client.CreatePropertyCondition(
+            self.uia.UIA_NamePropertyId, "RDP 未连接")
+        try:
+            root = self.client.ElementFromHandle(hwnd)
+            return bool(root.FindFirst(self.uia.TreeScope_Subtree, condition))
+        except self.COMError:
+            return False
 
 
 def child_connected_to_main(log_dir: Path, main_pid: int,
@@ -464,40 +478,129 @@ def monitor_completion(child_id: int, child_pid: int, log: CompletionLog) -> Non
         time.sleep(1)
 
 
-def close_after_completion(main_hwnd: int, main_pid: int, child_id: int) -> None:
+def process_exited(handle: int) -> bool:
+    state = ctypes.windll.kernel32.WaitForSingleObject(handle, 0)
+    if state == WAIT_OBJECT_0:
+        return True
+    if state == WAIT_TIMEOUT:
+        return False
+    raise ctypes.WinError()
+
+
+def close_after_completion(ui: FastUIA, desktop: DesktopContext) -> None:
+    """按配置清理分身，两条路径都等待主进程正常退出。"""
+    main_hwnd = desktop.main_hwnd
+    main_pid = desktop.main_pid
+    child_id = desktop.child_id
+    main_process = desktop.main_process
     current_child_id = child_session()
     if current_child_id not in (None, child_id):
         raise RuntimeError(
             f"桌面分身会话已变化（原 Session {child_id}，当前 {current_child_id}），"
             "为避免注销其他会话，已停止清理")
-    logger.info("注销桌面分身…")
-    if current_child_id == child_id:
-        if not ctypes.windll.wtsapi32.WTSLogoffSession(None, child_id, True):
-            raise RuntimeError(f"注销分身失败：{ctypes.WinError()}")
-        wait_for(lambda: child_session() is None, 15,
-                 "桌面分身会话注销完成", interval=0.25)
+    if process_exited(main_process):
+        if current_child_id is not None:
+            raise RuntimeError("BetterGI 主进程已退出，无法请求官方分身清理")
+        return
+    user32 = ctypes.windll.user32
+    if window_owner(desktop.child_hwnd) != main_pid:
+        raise RuntimeError("BetterGI 分身窗口句柄已变化，无法请求官方分身清理")
+    if USE_OFFICIAL_CLEANUP:
+        close_child_officially(ui, desktop, current_child_id)
+    else:
+        close_child_quietly(ui, desktop)
     logger.info("关闭 BetterGI 主进程…")
-    if not process_running(main_pid, "bettergi.exe"):
+    if process_exited(main_process):
         return
     if window_owner(main_hwnd) != main_pid:
         raise RuntimeError("BetterGI 主窗口句柄已变化，未向其他窗口发送关闭消息")
-    if not ctypes.windll.user32.PostMessageW(main_hwnd, 0x0010, 0, 0):  # WM_CLOSE
+    if not user32.PostMessageW(main_hwnd, 0x0010, 0, 0):  # WM_CLOSE
+        if process_exited(main_process):
+            return
         raise RuntimeError(f"发送关闭消息失败：{ctypes.WinError()}")
-    wait_for(lambda: not process_running(main_pid, "bettergi.exe"),
-             20, "BetterGI 主进程退出", interval=0.25)
+    wait_for(lambda: process_exited(main_process),
+             20, "BetterGI 主进程正常退出", interval=0.25)
+
+
+def close_child_quietly(ui: FastUIA, desktop: DesktopContext) -> None:
+    """通过系统接口有序断开和注销，主实例负责自身的正常退出清理。"""
+    child_id = desktop.child_id
+
+    def check_target() -> int | None:
+        current = child_session()
+        if current not in (None, child_id):
+            raise RuntimeError("桌面分身会话已变化，停止无弹窗清理")
+        if process_exited(desktop.main_process):
+            raise RuntimeError("BetterGI 主进程在分身清理完成前退出")
+        if window_owner(desktop.child_hwnd) != desktop.main_pid:
+            raise RuntimeError("BetterGI 分身窗口句柄已变化，停止无弹窗清理")
+        if named_process_running(child_id, GAME_NAMES):
+            raise RuntimeError("分身内游戏仍在运行，停止无弹窗清理")
+        return current
+
+    current = check_target()
+    if current is not None:
+        logger.info("无弹窗清理：先断开分身 RDP 连接…")
+        if not ctypes.windll.wtsapi32.WTSDisconnectSession(None, child_id, True):
+            raise RuntimeError(f"断开分身 RDP 失败：{ctypes.WinError()}")
+
+    def disconnected() -> bool:
+        check_target()
+        return ui.rdp_disconnected(desktop.child_hwnd)
+
+    wait_for(disconnected, 30, "BetterGI 确认 RDP 已断开", interval=0.25)
+    if check_target() is not None:
+        logger.info("BetterGI 已确认 RDP 断开；注销桌面分身…")
+        if not ctypes.windll.wtsapi32.WTSLogoffSession(None, child_id, True):
+            raise RuntimeError(f"注销分身失败：{ctypes.WinError()}")
+    wait_for(lambda: check_target() is None, 60, "桌面分身注销完成", interval=0.25)
+    logger.info("无弹窗分身清理已完成。")
+
+
+def close_child_officially(ui: FastUIA, desktop: DesktopContext,
+                           current_child_id: int | None) -> None:
+    main_pid = desktop.main_pid
+    child_id = desktop.child_id
+    main_process = desktop.main_process
+    user32 = ctypes.windll.user32
+    logger.info("请求 BetterGI 官方清理：断开 RDP 并注销桌面分身…")
+    # 分身窗口 OnClosing 的确认会进入官方 LogoffAndHideAsync。
+    if not user32.PostMessageW(desktop.child_hwnd, 0x0010, 0, 0):
+        raise RuntimeError(f"请求关闭分身窗口失败：{ctypes.WinError()}")
+    if current_child_id == child_id:
+        confirmation = wait_for(
+            lambda: find_window("关闭 BetterGI 桌面分身", session_of(main_pid), main_pid),
+            10, "BetterGI 官方分身关闭确认")
+        if child_session() not in (None, child_id):
+            raise RuntimeError("桌面分身会话已变化，未确认关闭")
+        ui.invoke(confirmation[0], ("是",), 10)
+
+    def officially_closed() -> bool:
+        current = child_session()
+        if current not in (None, child_id):
+            raise RuntimeError("桌面分身会话已变化，停止等待官方清理")
+        if process_exited(main_process):
+            raise RuntimeError("BetterGI 主进程在官方分身清理完成前退出")
+        # 官方流程在注销完成后隐藏窗口；只看到会话消失还不能关闭主实例。
+        return current is None and not user32.IsWindowVisible(desktop.child_hwnd)
+
+    wait_for(officially_closed, 60, "BetterGI 官方分身清理完成", interval=0.25)
+    logger.info("BetterGI 官方分身清理已完成。")
 
 
 @dataclass(frozen=True)
 class DesktopContext:
     main_hwnd: int
     main_pid: int
+    main_process: int
+    child_hwnd: int
     child_id: int
     old_child_pid: int
 
 
 @contextmanager
-def suppress_taskbar_flashing(main_pid: int) -> Iterator[None]:
-    """任务期间清除主进程最小化窗口的提醒，退出时停止后台线程。"""
+def suppress_taskbar_flashing(main_pid: int) -> Iterator[int]:
+    """持有主进程句柄并清除任务栏提醒，退出时停止线程和释放句柄。"""
     stop = threading.Event()
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
@@ -541,7 +644,7 @@ def suppress_taskbar_flashing(main_pid: int) -> Iterator[None]:
     worker = threading.Thread(target=clear_flashing, name="bgi-flash-stop", daemon=True)
     try:
         worker.start()
-        yield
+        yield process
     finally:
         stop.set()
         if worker.ident is not None:
@@ -601,13 +704,13 @@ def open_and_connect(ui: FastUIA, exe: Path, current_session: int,
                      20, "桌面分身窗口")
     child_hwnd, _ = child
     ui.invoke(child_hwnd, ("启动并连接", "启动"), 20)
-    with suppress_taskbar_flashing(main_pid):
+    with suppress_taskbar_flashing(main_pid) as main_process:
         minimize_windows(main_pid, child_hwnd, main_hwnd)
-        yield connect_child(exe, main_hwnd, main_pid, timeout)
+        yield connect_child(exe, main_hwnd, main_pid, main_process, child_hwnd, timeout)
 
 
-def connect_child(exe: Path, main_hwnd: int, main_pid: int,
-                  timeout: int) -> DesktopContext:
+def connect_child(exe: Path, main_hwnd: int, main_pid: int, main_process: int,
+                  child_hwnd: int, timeout: int) -> DesktopContext:
     logger.info("窗口最小化完成；等待桌面分身连接和登录…")
     child_id = wait_for(child_session, timeout, "桌面分身会话")
     logger.info("已发现分身 Session %s；等待分身内 BetterGI 启动…", child_id)
@@ -632,7 +735,7 @@ def connect_child(exe: Path, main_hwnd: int, main_pid: int,
         return child_connected_to_main(exe.parent / "log", main_pid, child_id, old_pid)
 
     wait_for(connected, 30, "分身 BetterGI 连接主实例")
-    return DesktopContext(main_hwnd, main_pid, child_id, old_pid)
+    return DesktopContext(main_hwnd, main_pid, main_process, child_hwnd, child_id, old_pid)
 
 
 def start_one_dragon(exe: Path, desktop: DesktopContext) -> tuple[CompletionLog, int]:
@@ -664,7 +767,10 @@ def run(exe: Path) -> None:
     with open_and_connect(ui, exe, current_session, 120) as desktop:
         log, child_pid = start_one_dragon(exe, desktop)
         monitor_completion(desktop.child_id, child_pid, log)
-        close_after_completion(desktop.main_hwnd, desktop.main_pid, desktop.child_id)
+        try:
+            close_after_completion(ui, desktop)
+        except Exception as exc:
+            raise RuntimeError(f"一条龙已完成，但分身或 BetterGI 主进程清理失败：{exc}") from exc
     logger.info("桌面分身与 BetterGI 主进程已关闭。")
 
 
